@@ -1,0 +1,11 @@
+{
+  "extends": "@tsconfig/node18/tsconfig.json",
+  "include": ["./src/**/*.ts"],
+  "compilerOptions": {
+    "module": "ESNext",
+    "outDir": "./dist/tsc/",
+    "resolveJsonModule": true,
+    "rootDir": "./",
+    "useUnknownInCatchVariables": false
+  }
+}
