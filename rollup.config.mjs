@@ -14,6 +14,7 @@ const external = [
 const globals = {
   'web-serial-polyfill': 'window.navigator',
   'web-streams-polyfill': 'window',
+  'webbluetooth': 'window.navigator',
   lodash: '_',
 }
 
@@ -39,6 +40,18 @@ export default [
     output: [
       { file: `dist/cjs/plugin/SerialPortAdapter.cjs`, format: 'cjs' },
       { file: `dist/es/plugin/SerialPortAdapter.mjs`, format: 'es' },
+    ]
+  },
+
+  // src/plugin/WebbleAdapter.ts (esm, iife)
+  {
+    external,
+    input: `src/plugin/WebbleAdapter.ts`,
+    plugins: [typescript(), nodeResolve({ browser: true }), commonjs(), nodePolyfills()],
+    output: [
+      { file: `dist/es/plugin/WebbleAdapter.mjs`, format: 'es' },
+      { file: 'dist/iife/plugin/WebbleAdapter.js', format: 'iife', globals, name: 'ChameleonWebbleAdapter' },
+      { file: 'dist/iife/plugin/WebbleAdapter.min.js', format: 'iife', globals, name: 'ChameleonWebbleAdapter', plugins: [terser()] },
     ]
   },
 

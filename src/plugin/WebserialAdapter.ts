@@ -1,13 +1,17 @@
 import _ from 'lodash'
+import { serial, type SerialPort } from 'web-serial-polyfill'
+import { sleep } from '../helper'
+import { type Buffer } from 'buffer'
 import { type ChameleonPlugin, type PluginInstallContext, type ChameleonSerialPort } from '../Chameleon'
-import { serial } from 'web-serial-polyfill'
 
 const WEBSERIAL_FILTERS = [
   { usbVendorId: 0x16d0, usbProductId: 0x04b2 }, // Chameleon Tiny
 ]
 
 export default class ChameleonWebserialAdapter implements ChameleonPlugin {
+  isOpen: boolean = false
   name = 'adapter'
+  port?: SerialPort & Partial<ChameleonSerialPort<Buffer, Buffer>> & { addEventListener?: CallableFunction }
 
   async install (context: AdapterInstallContext, pluginOption: any): Promise<AdapterInstallResp> {
     const { chameleon } = context
@@ -22,16 +26,19 @@ export default class ChameleonWebserialAdapter implements ChameleonPlugin {
 
       try {
         if (adapter.isSupported() !== true) throw new Error('WebSerial not supported')
-        const port = await serial?.requestPort({ filters: WEBSERIAL_FILTERS }) as any
-        if (_.isNil(port)) throw new Error('user canceled')
-        const info = await port.getInfo() as { usbVendorId: number, usbProductId: number }
-        chameleon.verboseLog(`port selected, usbVendorId = ${info.usbVendorId}, usbProductId = ${info.usbProductId}`)
+        this.port = await serial.requestPort({ filters: WEBSERIAL_FILTERS }) as any
+        if (_.isNil(this.port)) throw new Error('user canceled')
 
-        await port.open({ baudRate: 115200 })
-        port.isOpen = (): boolean => { return port._isOpen ?? false }
-        port._isOpen = true
-        port.addEventListener?.('disconnect', () => { void chameleon.disconnect() })
-        chameleon.port = port satisfies ChameleonSerialPort<Buffer, Buffer>
+        // port.open
+        this.port.isOpen = (): boolean => { return this.isOpen }
+        await this.port.open({ baudRate: 115200 })
+        while (_.isNil(this.port.readable) || _.isNil(this.port.writable)) await sleep(10) // wait for port.readable
+        this.isOpen = true
+
+        const info = await this.port.getInfo() as { usbVendorId: number, usbProductId: number }
+        chameleon.verboseLog(`port selected, usbVendorId = ${info.usbVendorId}, usbProductId = ${info.usbProductId}`)
+        this.port.addEventListener?.('disconnect', () => { void chameleon.disconnect() })
+        chameleon.port = this.port satisfies ChameleonSerialPort<Buffer, Buffer>
         return await next()
       } catch (err) {
         chameleon.verboseLog(err)
@@ -42,11 +49,11 @@ export default class ChameleonWebserialAdapter implements ChameleonPlugin {
     chameleon.addHook('disconnect', async (ctx: any, next: () => Promise<unknown>) => {
       if (chameleon.$adapter !== adapter) return await next() // 代表已經被其他 adapter 接管
 
-      const port = chameleon.port as any
-      port._isOpen = false
+      this.isOpen = false
       await next()
-      if (_.isNil(port)) return
-      port.close?.()
+      if (_.isNil(this.port)) return
+      await this.port.close()
+      delete this.port
     })
 
     return adapter as AdapterInstallResp

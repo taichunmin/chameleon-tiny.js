@@ -43,3 +43,11 @@ export function middlewareCompose (middlewares: MiddlewareComposeFn[]): (ctx: Re
 export async function sleep (ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
+
+export function asBuffer (input: any, encoding: BufferEncoding = 'binary'): Buffer {
+  if (Buffer.isBuffer(input)) return input
+  if (_.isString(input)) return Buffer.from(input, encoding)
+  if (input instanceof ArrayBuffer) input = new Uint8Array(input)
+  if (ArrayBuffer.isView(input)) return Buffer.from(input.buffer, input.byteOffset, input.byteLength)
+  return Buffer.from(input)
+}

@@ -1,0 +1,597 @@
+extends /include/bootstrapV4
+
+block beforehtml
+  - const title = 'Amiibo for ChameleonTiny'
+
+block style
+  style
+    :sass
+      [v-cloak]
+        display: none
+      body, .h1, .h2, .h3, .h4, .h5, .h6, h1, h2, h3, h4, h5, h6
+        font-family: 'Noto Sans TC', sans-serif
+      .img-amiibo1
+        aspect-ratio: 288/359
+        background-position: center
+        background-repeat: no-repeat
+        background-size: contain
+        width: 72px
+      .img-amiibo2
+        aspect-ratio: 288/359
+        background-position: center
+        background-repeat: no-repeat
+        background-size: contain
+
+block content
+  #app.my-3.container(v-cloak)
+    h4.text-center= title
+    .form-group.mt-3
+      label Choose connection method:
+      select.form-control.form-control-sm(v-model="h.adapter")
+        option(value="ble") via Bluetooth (Android only)
+        option(value="usb") via USB Serial (PC only)
+    .row.mx-n1(v-if="ready")
+      .col-12.col-md-6.px-1.mt-2(v-for="setting, settingIdx of h.settings")
+        .card
+          .card-header.d-flex.align-items-center
+            i.fa.fa-fw.mr-1.ml-n2(
+              :class="['fa-chevron-right', 'fa-chevron-down'][settingCollapse[settingIdx] ?? 0]"
+              @click="$set(settingCollapse, settingIdx, 1 - (settingCollapse[settingIdx] ?? 0))"
+            )
+            h5.mb-0.flex-fill(@click="$set(settingCollapse, settingIdx, 1 - (settingCollapse[settingIdx] ?? 0))") Setting \#{{ settingIdx + 1 }}
+            .btn-group.btn-group-sm.my-n2.mr-n2
+              button.btn.btn-outline-success(@click="btnWriteChameleon(setting)") Write
+              button.btn.btn-outline-success.dropdown-toggle.dropdown-toggle-split(type="button", data-toggle="dropdown")
+              .dropdown-menu.dropdown-menu-right.py-0
+                button.dropdown-item.text-danger(type="button", @click="h.settings.splice(settingIdx, 1)") Delete
+          ul.list-group.list-group-flush(v-if="settingCollapse[settingIdx] ?? 0")
+            li.list-group-item.d-flex.p-2(
+              v-for="slot, slotIdx of setting"
+              @click="btnPickAmiibo(setting, slotIdx)"
+            )
+              template(v-for="amiibo of [getAmiiboByAmiiboId(slot.id)]")
+                template(v-if="amiibo")
+                  .img-amiibo1(:style="`background-image: url(${amiibo?.image})`")
+                  .flex-fill.ml-3
+                    small.text-primary Slot \#{{ slotIdx + 1 }}
+                    h5.mb-1 {{ amiibo?.amiibo?.name }}
+                    small: .text-muted {{ amiibo?.gameSeries }}
+                    small: .text-muted.text-monospace {{ slot.id }}
+                template(v-else)
+                  .img-amiibo1
+                  .flex-fill.ml-3
+                    small.text-primary Slot \#{{ slotIdx + 1 }}
+                    h5.mb-1 Not selected
+                    small: .text-muted Click here to select amiibo.
+                    small: .text-muted.text-monospace &nbsp;
+          table.mb-0.table.table-bordered(v-else)
+            tr(v-for="row of _.chunk(_.map(setting, slot => getAmiiboByAmiiboId(slot.id)), 4)")
+              td.p-2(v-for="amiibo of row")
+                .img-amiibo2(:style="`background-image: url(${amiibo?.image ?? ''})`")
+    button.mt-3.btn.btn-block.btn-primary(@click="btnNewSetting") Add new setting
+    button.mt-2.btn.btn-block.btn-outline-danger(@click="btnReset") Clear all settings
+    .modal.fade(data-keyboard="false", tabindex="-1", ref="amiiboPicker")
+      .modal-dialog.modal-dialog-centered.modal-xl
+        .modal-content
+          .modal-header.d-flex.align-items-center
+            .input-group
+              .input-group-prepend: span.input-group-text Search
+              input.form-control#h-keyword(placeholder="Amiibo name, game" v-model="amiiboPicker.search")
+              .input-group-append: button.btn.btn-outline-danger(type="button", @click="amiiboPicker.search = ''") Clear
+            button.close(type="button", data-dismiss="modal"): span &times;
+          .modal-body.p-0
+            ul.list-group.list-group-flush
+              li.list-group-item.d-flex.p-2(
+                v-for="amiibo of filteredAmiibos"
+                @click="amiiboPicker.cb?.(amiibo.amiiboId)"
+              )
+                .img-amiibo1(:style="`background-image: url(${amiibo?.image})`")
+                .flex-fill.d-flex.flex-column.justify-content-between.ml-3
+                  h5.mb-1 {{ amiibo?.amiibo?.name }}
+                  small: .text-muted {{ amiibo?.gameSeries }}
+                  small: .text-muted.text-monospace {{ amiibo.amiiboId }}
+              li.list-group-item.d-flex.p-2(v-if="filteredAmiibos.length === 0")
+                .flex-fill.text-center.py-3 Please enter any amiibo name or game to search.
+
+block script
+  script(crossorigin="anonymous", src="https://cdn.jsdelivr.net/npm/pn532.js@0/dist/Packet.min.js")
+  script(crossorigin="anonymous", src="https://cdn.jsdelivr.net/npm/crypto-js@4/crypto-js.min.js")
+  script.
+    const { Buffer, Chameleon } = ChameleonJS // eslint-disable-line no-unused-vars
+    const chameleonUsb = new Chameleon(console.log)
+    chameleonUsb.use(new ChameleonWebserialAdapter())
+    const chameleonBle = new Chameleon(console.log)
+    chameleonBle.use(new ChameleonWebbleAdapter())
+
+    /* global Packet */
+    ;(() => { // extend Packet
+      Packet.fromWordArray = wordArray => {
+        const { words, sigBytes } = wordArray
+        const pack = new Packet(sigBytes)
+        for (let i = 0; i < sigBytes; i++) pack[i] = (words[i >>> 2] >>> (24 - (i % 4) * 8)) & 0xFF
+        return pack
+      }
+      Packet.prototype.toWordArray = function () {
+        const { lib: { WordArray } } = CryptoJS
+        return new WordArray.init(this) // eslint-disable-line new-cap
+      }
+    })()
+
+    // see: https://firefox2100.github.io/proxmark3/2022/03/17/Amiibo_1/
+    const RETAIL_KEY = Packet.fromBase64('HRZLN1typVcouR1ktqPCBXVuZml4ZWQgaW5mb3MAAA7bS54_RSePOX7_m0-5kwAABEkX3Ha0lkDW-Dk5lg-u1O85L6qyFCiqIftU5UUFR2Z_dS0oc6IAF_74XAV1kEttbG9ja2VkIHNlY3JldAAAEP3IoHaUuJ5MR9N96M5cdMEESRfcdrSWQNb4OTmWD67U7zkvqrIUKKoh-1TlRQVHZg') // UNFIXED_INFOS: 80 bytes + LOCKED_SECRET: 80 bytes
+    class AmiiboNtag215 {
+      constructor () {
+        this.pack = new Packet(540) // encrypted
+        this.keys = null
+      }
+
+      static fromNtag215 (input) {
+        if (!Packet.isLen(input, 540)) throw new TypeError(`invalid NTAG215 dump: ${input?.length} bytes`)
+        const tag = new AmiiboNtag215()
+        tag.pack.set(input) // clone
+        tag.fixPwd() // because pwd can not be read from NTAG215, so we need to regenerate
+        tag.pack = tag.encrypted
+        return tag
+      }
+
+      static concatFromByteMaps (src, byteMaps = []) {
+        return Packet.merge(..._.map(byteMaps, ([offset, len]) => src.subarray(offset, offset + len)))
+      }
+
+      static fromAmiitool (amiitool) {
+        if (!Packet.isLen(amiitool)) throw new TypeError('amiitool should be instance of Packet')
+        if (!_.includes([520, 540], amiitool.length)) throw new TypeError(`invalid amiitool.length = ${amiitool?.length}`)
+        const tag = new AmiiboNtag215()
+        // https://github.com/socram8888/amiitool/blob/master/amiibo.c#L63
+        tag.pack = AmiiboNtag215.concatFromByteMaps(amiitool, [ // Don't change the order
+          [0x1D4, 0x008], // NTAG215 UID
+          [0x000, 0x008], // Lock/CC
+          [0x028, 0x024], // 0x28: Counter, 0x2A: Init Date, 0x2C: Modified Date, 0x2E: Hash?, 0x34: Console #, 0x38: Nickname
+          [0x1B4, 0x020], // LOCKED_SECRET HS256
+          [0x1DC, 0x02C], // 0x1DC: Char. ID (AmiiboId), 0x1E4: Crypto Seed
+          [0x008, 0x020], // UNFIXED_INFOS HS256
+          [0x04C, 0x168], // 0x04C: Mii, 0x0B4: Write Counter, 0x0B6: App ID, 0x0BC: Hash, 0x0DC: App Data
+          [0x208, 0x014], // Dynamic Lock Bytes, MIRROR, ACCESS, PWD, PACK
+        ])
+        return tag
+      }
+
+      static fromAmiiboId (amiiboId) {
+        if (!_.isString(amiiboId) || amiiboId.length !== 16) throw new TypeError(`invalid amiiboId: ${amiiboId}`)
+        const tag = new AmiiboNtag215()
+        tag.randomUid() // 0x000-0x008: uid, bcc0, bcc1
+        // 0x054-0x05B: AmiiboId
+        tag.pack.set(Packet.fromHex(amiiboId), 0x054)
+        // 0x060-0x07F: Keygen Salt
+        tag.pack.set(AmiiboNtag215.randomBytes(32), 0x060)
+        tag.fixTag()
+        return tag
+      }
+
+      static fromNtag215OrAmiitool (input) {
+        const { fromNtag215, fromAmiitool } = AmiiboNtag215
+        const isNtag215 = (input.subarray(0, 3).xor ^ 0x88) === input[3] && input.subarray(4, 8).xor === input[8]
+        return isNtag215 ? fromNtag215(input) : fromAmiitool(input)
+      }
+
+      static hs256 (pack, secret) {
+        return Packet.fromWordArray(CryptoJS.HmacSHA256(pack.toWordArray(), secret.toWordArray()))
+      }
+
+      static aes128Ctr (pack, key, iv) {
+        const encrypted = CryptoJS.AES.encrypt(pack.toWordArray(), key.toWordArray(), {
+          iv: iv.toWordArray(),
+          mode: CryptoJS.mode.CTR,
+          padding: CryptoJS.pad.NoPadding,
+        })
+        return Packet.fromWordArray(encrypted.ciphertext)
+      }
+
+      static generateKeyBySeedAndRetailKey (baseSeed, retail) {
+        const { hs256 } = AmiiboNtag215
+        const seed = new Packet(baseSeed)
+        seed.set(retail.subarray(16, 30), 2) // key type: LOCKED_SECRET or UNFIXED_INFOS
+        if (retail[31] === 16) seed.set(retail.subarray(32, 48), 16) // 16 magic bytes
+        else seed.set(retail.subarray(32, 46), 18) // 14 magic bytes
+        for (let i = 0; i < 32; i++) seed[48 + i] ^= retail[48 + i] // xorPad
+        const res = {}
+        if (retail[31] === 14) [res.aesKey, res.aesIv] = hs256(seed, retail.subarray(0, 16)).chunk(16)
+        seed[1] = 1
+        res.secret = hs256(seed, retail.subarray(0, 16)).subarray(0, 16)
+        return res
+      }
+
+      static parseDate (raw) { return `${(raw >>> 9) + 2000}-${(raw >>> 5) & 0x0F}-${(raw >>> 0) & 0x1F}` }
+
+      static calcSign1 (input, { secret1 }) {
+        const { hs256, concatFromByteMaps } = AmiiboNtag215
+        return hs256(concatFromByteMaps(input, [
+          [0x000, 0x008], // uid + bcc0
+          [0x054, 0x00c], // model
+          [0x060, 0x020], // salt
+        ]), secret1)
+      }
+
+      static calcSign2 (input, { secret2 }) {
+        const { hs256, concatFromByteMaps } = AmiiboNtag215
+        return hs256(concatFromByteMaps(input, [
+          [0x011, 0x023], // setting.slice(1)
+          [0x0A0, 0x168], // appData
+          [0x034, 0x020], // sign1
+          [0x000, 0x008], // uid + bcc0
+          [0x054, 0x00c], // model
+          [0x060, 0x020], // salt
+        ]), secret2)
+      }
+
+      static calcPwd (uid) {
+        const pwd = Packet.fromHex('AA55AA55')
+        for (let i = 0; i < 4; i++) pwd[i] ^= uid[i + 1] ^ uid[i + 3]
+        return pwd
+      }
+
+      static randomBytes (len) {
+        return Packet.fromWordArray(CryptoJS.lib.WordArray.random(len))
+      }
+
+      get uid () { return AmiiboNtag215.concatFromByteMaps(this.pack, [[0, 3], [4, 4]]) }
+      get setting () { return this.pack.subarray(0x10, 0x34) } // Tag setting
+      get sign1 () { return this.pack.subarray(0x34, 0x54) } // Tag HS256
+      get amiiboId () { return this.pack.subarray(0x54, 0x5C).hex }
+      get salt () { return this.pack.subarray(0x60, 0x80) } // Keygen Salt
+      get sign2 () { return this.pack.subarray(0x80, 0xA0) } // appData HS256
+      get pwd () { return this.pack.subarray(0x214, 0x218) } // read pwd
+
+      // https://github.com/hax0kartik/wumiibo/blob/master/source/AmiiboFile.cpp
+      get flag () { return this.pack[0x2C] }
+      get hasUserData () { return (this.flag >>> 4) & 1 }
+      get hasAppData () { return (this.flag >>> 5) & 1 }
+      get countryCode () { return this.pack[0x2D] }
+      get initDate () { return AmiiboNtag215.parseDate(this.pack.getUint16(0x30, false)) }
+      get modifiedDate () { return AmiiboNtag215.parseDate(this.pack.getUint16(0x32, false)) }
+      get nickname () { return new TextDecoder('utf-16be').decode(this.pack.subarray(0x38, 0x4c)) }
+
+      get parsedUserData () { // https://github.com/hax0kartik/wumiibo/blob/master/source/amiibo_structs.h
+        if (!this.hasUserData) return undefined
+        return {
+          countryCodeId: this.pack[45], // Country Code ID, from the system which setup this amiibo.
+          flag: this.flag & 0x0F, // See also the Amiibo_amiiboFlag enums.
+          mii: this.pack.subarray(76, 172), // [0x4C, 0x4C + 0x60], Owner Mii.
+          nickname: this.pack.subarray(56, 76), // [0x38, 0x38 + 0x14], UTF-16BE Amiibo nickname.
+          lastWriteDate: AmiiboNtag215.parseDate(this.pack.getUint16(50, false)),
+          setupDate: AmiiboNtag215.parseDate(this.pack.getUint16(48, false)),
+        }
+      }
+
+      get parsedAppDataConfig () {
+        if (!this.hasAppData) return undefined
+        return {
+          appId: this.pack.getUint32(182, false),
+          counter: this.pack.getUint16(180, false),
+          // Amiibo module writes hard-coded uint8_t value 0xD8 here. This is the size of the Amiibo AppData, apps can use this with the AppData R/W commands. ...
+          data: this.pack.subarray(220, 436), // [0xDC, 0xDC + 0xD8]
+          titleId: this.pack.subarray(172, 180), // BigUint64
+          unk: this.flag >>> 4,
+        }
+      }
+
+      get encrypted () {
+        return this.encryptOrDecrypt(this.pack)
+      }
+
+      toAmiitool () {
+        const { concatFromByteMaps } = AmiiboNtag215
+        // https://github.com/socram8888/amiitool/blob/master/amiibo.c#L53
+        return concatFromByteMaps(this.pack, [ // Don't change the order
+          [0x008, 0x008], // Lock/CC
+          [0x080, 0x020], // UNFIXED_INFOS HS256
+          [0x010, 0x024], // 0x10: Counter, 0x12: Init Date, 0x14: Modified Date, 0x16: Hash?, 0x1C: Console #, 0x20: Nickname
+          [0x0A0, 0x168], // 0x0A0: Mii, 0x0108: Write Counter, 0x10A: App ID, 0x110: Hash, 0x130: App Data
+          [0x034, 0x020], // LOCKED_SECRET HS256
+          [0x000, 0x008], // NTAG215 UID
+          [0x054, 0x02C], // 0x54: Char. ID (AmiiboId), 0x5C: Crypto Seed
+          [0x208, 0x014], // Dynamic Lock Bytes, MIRROR, ACCESS, PWD, PACK
+        ])
+      }
+
+      generateKeys () {
+        const LOCKED_SECRET = RETAIL_KEY.subarray(80) // for sign1
+        const UNFIXED_INFOS = RETAIL_KEY.subarray(0, 80) // for sign2
+        const { generateKeyBySeedAndRetailKey } = AmiiboNtag215
+        const keys = {}
+        const baseSeed = Packet.merge(
+          new Packet(16),
+          this.setting.subarray(1, 3), // 2 bytes: [17, 19]
+          new Packet(14),
+          this.pack.subarray(0, 8), // uid + bcc0
+          this.pack.subarray(0, 8), // uid + bcc0
+          this.salt,
+        )
+        // - console.log(`baseSeed = ${baseSeed.base64url}`)
+
+        const key1 = generateKeyBySeedAndRetailKey(baseSeed, LOCKED_SECRET)
+        keys.secret1 = key1.secret
+
+        const key2 = generateKeyBySeedAndRetailKey(baseSeed, UNFIXED_INFOS)
+        keys.secret2 = key2.secret
+        keys.aesKey = key2.aesKey
+        keys.aesIv = key2.aesIv
+
+        this.keys = keys
+      }
+
+      encryptOrDecrypt (input) {
+        const { aes128Ctr, concatFromByteMaps } = AmiiboNtag215
+        if (!this.keys) this.generateKeys()
+        const { aesKey, aesIv } = this.keys
+        const encryptByteMaps = [
+          [0x014, 0x020], // setting.slice(4)
+          [0x0A0, 0x168], // appData
+        ]
+        const payload = concatFromByteMaps(input, encryptByteMaps)
+        const encrypted = aes128Ctr(payload, aesKey, aesIv)
+        const output = input.slice()
+        let offset1 = 0
+        for (const [offset2, len] of encryptByteMaps) {
+          output.set(encrypted.subarray(offset1, offset1 + len), offset2)
+          offset1 += len
+        }
+        return output
+      }
+
+      isValidSign1 () {
+        const { calcSign1 } = AmiiboNtag215
+        if (!this.keys) this.generateKeys()
+        const sign1 = calcSign1(this.pack, this.keys)
+        return sign1.isEqual(this.sign1)
+      }
+
+      isValidSign2 () {
+        const { calcSign2 } = AmiiboNtag215
+        if (!this.keys) this.generateKeys()
+        const sign2 = calcSign2(this.pack, this.keys)
+        return sign2.isEqual(this.sign2)
+      }
+
+      isValidPwd () {
+        const { calcPwd } = AmiiboNtag215
+        const pwd = calcPwd(this.uid)
+        return pwd.isEqual(this.pwd)
+      }
+
+      isValid () {
+        // console.log(`isValid = ${JSON.stringify([this.isValidPwd(), this.isValidSign1(), this.isValidSign2()])}`)
+        return this.isValidPwd() && this.isValidSign1() && this.isValidSign2()
+      }
+
+      fixPwd () {
+        const { calcPwd } = AmiiboNtag215
+        this.pwd.set(calcPwd(this.uid))
+        this.pack.setUint16(0x218, 0x8080, false) // password ack
+      }
+
+      fixSignature () {
+        const { calcSign1, calcSign2 } = AmiiboNtag215
+        this.pack.set(calcSign1(this.pack, this.keys), 0x34) // sign1
+        this.pack.set(calcSign2(this.pack, this.keys), 0x80) // sign2
+      }
+
+      fixUid () {
+        this.pack[0] = 0x04 // uid0 = NXP (0x04)
+        this.pack[3] = this.pack.subarray(0, 3).xor ^ 0x88 // bcc0 = CT (0x88) ^ uid0 ^ uid1 ^ uid2
+        this.pack[8] = this.pack.subarray(4, 8).xor // bcc1 = uid3 ^ uid4 ^ uid5 ^ uid6
+      }
+
+      fixData () {
+        // https://gitlab.com/tagmo/amiibo-generator/-/blob/android/script.js#L98
+        // 0x009-0x014: Internal, Static Lock, CC, 0xA5, two bytes for write counter, unknown byte
+        this.pack.set(Packet.fromHex('480FE0F110FFEEA5000000'), 0x009)
+        // 0x208-0x213: Dynamic Lock, RFUI, CFG0, CFG1
+        this.pack.set(Packet.fromHex('01000FBD000000045F000000'), 0x208)
+      }
+
+      fixTag () {
+        this.fixUid() // fix uid bcc0, bcc1
+        this.fixData() // fix static data
+        this.fixPwd() // re-generate pwd
+        this.generateKeys() // re-generate keys
+        this.fixSignature() // fix sign1, sign2
+      }
+
+      setUid (uid7b) {
+        // You need to handle encryption/decryption yourself
+        if (!Packet.isLen(uid7b, 7)) throw new TypeError('invalid uid7b')
+        if (uid7b[0] !== 0x04) throw new TypeError('uid7b[0] should be NXP (0x04)')
+        this.pack.set(uid7b.subarray(0, 3), 0)
+        this.pack.set(uid7b.subarray(3, 7), 4)
+        this.fixUid()
+      }
+
+      randomUid () {
+        const uid7b = AmiiboNtag215.randomBytes(7)
+        uid7b[0] = 0x04
+        this.setUid(uid7b)
+      }
+    }
+
+    window.vm = new Vue({
+      el: '#app',
+      data: {
+        ready: false,
+        settingCollapse: [],
+        amiiboPicker: { cur: null, cb: null, search: '' },
+        h: {
+          adapter: 'ble',
+          settings: [],
+        },
+      },
+      async mounted () {
+        // 自動儲存功能
+        try {
+          const saved = JSON5.parse(localStorage.getItem(location.pathname))
+          if (saved) this.$set(this, 'h', { ...this.h, ...saved })
+        } catch (err) {}
+        this.$watch('h', () => {
+          localStorage.setItem(location.pathname, JSON5.stringify(this.h))
+        }, { deep: true })
+
+        await this.init()
+      },
+      computed: {
+        chameleon () {
+          return this.h.adapter === 'usb' ? chameleonUsb : chameleonBle
+        },
+        filteredAmiibos () {
+          const text = _.trim(_.toLower(this.amiiboPicker.search ?? ''))
+          if (!this.ready || text === '') return []
+          const { amiiboApi } = window
+          const getMatchScore = (str, search, scoreEqual, scorePartial) => {
+            if (!str || !search) return 0
+            str = _.toLower(str)
+            if (str === search) return scoreEqual
+            if (str.indexOf(search) >= 0) return scorePartial
+            return 0
+          }
+          console.log(`text: ${text}`)
+          const filtered = []
+          for (const k1 of _.keys(amiiboApi.amiibo?.amiibos)) {
+            const amiiboId = k1.slice(2)
+            const tmp = { amiiboId, score: 0 }
+            if (text === amiiboId) tmp.score += 100
+            const amiibo = this.getAmiiboByAmiiboId(amiiboId)
+            tmp.score += getMatchScore(amiibo?.amiibo?.name, text, 90, 40)
+            tmp.score += getMatchScore(amiibo?.gameSeries, text, 80, 30)
+            tmp.score += getMatchScore(amiibo?.character, text, 70, 20)
+            tmp.score += getMatchScore(amiibo?.amiiboSeries, text, 60, 10)
+            if (tmp.score > 0) filtered.push({ ...tmp, ...amiibo })
+          }
+          return _.orderBy(filtered, ['score', 'amiiboId'], ['desc', 'asc'])
+        },
+      },
+      methods: {
+        async init () {
+          try {
+            this.showLoading('Loading', 'initializing...')
+            await this.fetchAmiiboApi()
+            if (this.h.settings.length === 0) this.btnNewSetting()
+            this.ready = true
+            Swal.close()
+          } catch (err) {
+            await Swal.fire({ icon: 'error', title: 'Failed to initialize', text: err.message })
+          }
+        },
+        async fetchAmiiboApi () {
+          try {
+            const db = {}
+            const AmiiboApiPrefix = 'https://raw.githubusercontent.com/N3evin/AmiiboAPI/master/database/'
+            ;[db.amiibo, db.games] = await Promise.all([
+              (async () => {
+                return (await axios.get(`${AmiiboApiPrefix}amiibo.json`))?.data
+              })(),
+              (async () => {
+                return (await axios.get(`${AmiiboApiPrefix}games_info.json`))?.data
+              })(),
+            ])
+            window.amiiboApi = db
+          } catch (err) {
+            console.error(err)
+            throw err
+          }
+        },
+        async btnPickAmiibo (parent, key) {
+          console.log(parent, key)
+          const $ref = window.jQuery(this.$refs.amiiboPicker)
+          const newVal = await new Promise(resolve => {
+            this.$set(this, 'amiiboPicker', {
+              ...this.amiiboPicker,
+              cb: resolve,
+              cur: parent?.key?.id,
+            })
+            $ref.one('hide.bs.modal', () => resolve()).modal('show')
+          })
+          $ref.modal('hide')
+          this.$set(this.amiiboPicker, 'cb', null)
+          if (_.isNil(newVal)) return
+          this.$set(parent, key, { id: newVal })
+        },
+        async btnCmdGetVersion () {
+          try {
+            const version = await this.chameleon.cmdGetVersion()
+            Swal.fire({ icon: 'success', title: 'Chameleon 版本', text: version })
+          } catch (err) {
+            Swal.fire({ icon: 'error', title: '發生錯誤', text: err.message })
+          }
+        },
+        async btnWriteChameleon (setting) {
+          try {
+            let successed = 0
+            this.showLoading('Writing', 'waiting for connection...')
+            await this.chameleon.connect()
+            for (let [slotIdx, slot] of _.toPairs(setting)) {
+              try {
+                if (!this.chameleon.isConnected()) break
+                const amiiboId = slot.id
+                slotIdx = _.toInteger(slotIdx) + 1
+                if (!amiiboId) continue
+                this.showLoading(`Writing slot #${slotIdx}...`, `Successed: ${successed}`)
+                console.log(`slotIdx = ${slotIdx}, amiiboId = ${amiiboId}`)
+                const tag = AmiiboNtag215.fromAmiiboId(amiiboId)
+                await this.chameleon.cmdSetSetting(`${slotIdx}`)
+                await this.chameleon.cmdExecClear()
+                await this.chameleon.cmdSetConfig('NTAG215')
+                await this.chameleon.cmdExecUpload(Buffer.from(tag.encrypted))
+                successed++
+              } catch (err) {
+                console.error(err)
+              }
+            }
+            await Swal.fire({ icon: 'success', title: 'Write result', text: `${successed} slots write successfully!` })
+          } catch (err) {
+            console.error(err)
+            await Swal.fire({ icon: 'error', title: 'Failed to write', text: err.message })
+          }
+        },
+        async btnReset (confirm = true) {
+          if (confirm) {
+            confirm = await Swal.fire({
+              cancelButtonColor: '#3085d6',
+              cancelButtonText: 'No, cancel!',
+              confirmButtonColor: '#d33',
+              confirmButtonText: 'Yes, reset!',
+              focusCancel: true,
+              icon: 'warning',
+              showCancelButton: true,
+              text: 'Clear all settings?',
+            })
+            if (!confirm.value) return
+          }
+          localStorage.removeItem(location.pathname)
+          location.reload()
+          return await new Promise(resolve => {})
+        },
+        getAmiiboByAmiiboId (amiiboId) {
+          if (!/^[0-9A-Fa-f]{16}$/.test(amiiboId)) return null
+          amiiboId = _.toLower(amiiboId)
+          return {
+            amiibo: window.amiiboApi?.amiibo?.amiibos?.[`0x${amiiboId}`],
+            amiiboSeries: window.amiiboApi?.amiibo?.amiibo_series?.[`0x${amiiboId.slice(12, 14)}`],
+            character: window.amiiboApi?.amiibo?.characters?.[`0x${amiiboId.slice(0, 4)}`],
+            gameSeries: window.amiiboApi?.amiibo?.game_series?.[`0x${amiiboId.slice(0, 3)}`],
+            image: `https://raw.githubusercontent.com/N3evin/AmiiboAPI/master/images/icon_${amiiboId.slice(0, 8)}-${amiiboId.slice(8)}.png`,
+            type: window.amiiboApi?.amiibo?.types?.[`0x${amiiboId.slice(6, 8)}`],
+          }
+        },
+        btnNewSetting () {
+          this.h.settings.push(_.times(8, () => ({ id: null })))
+        },
+        showLoading (title, text) {
+          Swal.fire({
+            title,
+            text,
+            allowOutsideClick: false,
+            showConfirmButton: false,
+            willOpen: () => { Swal.showLoading() },
+          })
+        },
+      },
+    })

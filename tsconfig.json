@@ -1,11 +1,16 @@
 {
   "extends": "@tsconfig/node18/tsconfig.json",
-  "include": ["./src/**/*.ts"],
+  "include": ["./**/*.mjs", "./**/*.ts"],
   "compilerOptions": {
     "module": "ESNext",
     "outDir": "./dist/tsc/",
     "resolveJsonModule": true,
     "rootDir": "./",
     "useUnknownInCatchVariables": false
+  },
+  "ts-node": {
+    "compilerOptions": {
+      "module": "CommonJS",
+    }
   }
 }

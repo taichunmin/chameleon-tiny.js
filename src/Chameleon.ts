@@ -1,6 +1,6 @@
 import _ from 'lodash'
 import { Buffer } from 'buffer'
-import { middlewareCompose, sleep, type MiddlewareComposeFn } from './helper'
+import { asBuffer, middlewareCompose, sleep, type MiddlewareComposeFn } from './helper'
 import { type ReadableStream, type UnderlyingSink, WritableStream } from 'web-streams-polyfill'
 
 const READ_DEFAULT_TIMEOUT = 5e3
@@ -10,7 +10,7 @@ export class Chameleon {
   hooks: Record<string, MiddlewareComposeFn[]>
   plugins: Map<string, ChameleonPlugin>
   port?: ChameleonSerialPort<Buffer, Buffer>
-  rxSubscriber?: ChameleonRxSubscriber
+  rxSink?: ChameleonRxSink
   supportedConfs?: Set<string>
   verboseFunc?: (text: string) => void
   versionString: string = ''
@@ -50,10 +50,13 @@ export class Chameleon {
       try {
         if (_.isNil(this.port)) throw new Error('this.port is undefined. Did you remember to use adapter plugin?')
 
-        // serial.readable pipeTo this.rxSubscriber
-        this.rxSubscriber = new ChameleonRxSubscriber()
-        void this.port.readable.pipeTo(new WritableStream(this.rxSubscriber))
-          .catch(err => { throw _.set(new Error('serial.readable.pipeTo error'), 'originalError', err) })
+        // serial.readable pipeTo this.rxSink
+        this.rxSink = new ChameleonRxSink()
+        void this.port.readable.pipeTo(new WritableStream(this.rxSink))
+          .catch(err => {
+            void this.disconnect()
+            throw _.set(new Error('serial.readable.pipeTo error'), 'originalError', err)
+          })
 
         // Send escape key to force clearing the Chameleon's input buffer
         await this.writeBuffer(Buffer.from(CHAR.ESCAPE, 'ascii'))
@@ -63,9 +66,9 @@ export class Chameleon {
         this.versionString = await this.cmdGetVersion()
         this.supportedConfs = new Set(await this.getCmdSuggestions(COMMAND.CONFIG))
       } catch (err) {
-        await this.disconnect()
         this.verboseLog(`Failed to connect: ${err.message as string}`)
-        throw _.set(new Error('Failed to connect'), 'originalError', err)
+        if (this.isConnected()) await this.disconnect()
+        throw _.set(new Error(err.message ?? 'Failed to connect'), 'originalError', err)
       }
     })
   }
@@ -95,13 +98,13 @@ export class Chameleon {
         await writer.write(ctx.buf)
         writer.releaseLock()
       } catch (err) {
-        throw _.set(new Error('Failed to write buffer'), 'originalError', err)
+        throw _.set(new Error(err.message ?? 'Failed to write buffer'), 'originalError', err)
       }
     })
   }
 
   clearRxBufs (): void {
-    this.rxSubscriber?.bufs.splice(0, this.rxSubscriber.bufs.length)
+    this.rxSink?.bufs.splice(0, this.rxSink.bufs.length)
   }
 
   async readLineTimeout<T> ({ timeout }: { timeout?: number }): Promise<RxReadResp<T>> {
@@ -113,8 +116,8 @@ export class Chameleon {
     return await this.invokeHook('readLineTimeout', { timeout }, async (ctx: Context, next) => {
       try {
         if (!this.isConnected()) await this.connect()
-        const rxSubscriber = this.rxSubscriber
-        if (_.isNil(rxSubscriber)) throw new Error('rxSubscriber is undefined')
+        const rxSink = this.rxSink
+        if (_.isNil(rxSink)) throw new Error('rxSink is undefined')
         const resp: Partial<RxReadResp<string | boolean>> = {}
         ctx.timeout = ctx.timeout ?? READ_DEFAULT_TIMEOUT
         ctx.startedAt = Date.now()
@@ -122,13 +125,13 @@ export class Chameleon {
           if (!this.isConnected()) throw new Error('device disconnected')
           ctx.nowts = Date.now()
           if (ctx.nowts > ctx.startedAt + ctx.timeout) throw new Error(`readLineTimeout ${ctx.timeout}ms`)
-          while (true) {
-            const buf = Buffer.concat(rxSubscriber.bufs ?? [])
+          while (rxSink.bufs?.length > 0) {
+            const buf = Buffer.concat(rxSink.bufs)
             const indexEol = buf.indexOf(CHAR.LF)
             if (indexEol < 0) break // line ending not found
 
             this.clearRxBufs()
-            rxSubscriber.bufs.push(buf.subarray(indexEol + 1))
+            rxSink.bufs.push(buf.subarray(indexEol + 1))
             const text = _.trim(buf.subarray(0, indexEol).toString('ascii'))
 
             if (resp.statusCode === STATUS_CODE.OK_WITH_TEXT) {
@@ -158,8 +161,8 @@ export class Chameleon {
       nowts?: number
       timeout?: number
     }
-    const rxSubscriber = this.rxSubscriber
-    if (_.isNil(rxSubscriber)) throw new Error('rxSubscriber is undefined')
+    const rxSink = this.rxSink
+    if (_.isNil(rxSink)) throw new Error('rxSink is undefined')
     return await this.invokeHook('readBytesTimeout', { timeout }, async (ctx: Context, next) => {
       try {
         if (!this.isConnected()) await this.connect()
@@ -169,10 +172,10 @@ export class Chameleon {
           if (!this.isConnected()) throw new Error('device disconnected')
           ctx.nowts = Date.now()
           if (ctx.nowts > ctx.startedAt + ctx.timeout) throw new Error(`readBytesTimeout ${ctx.timeout}ms`)
-          const buf = Buffer.concat(rxSubscriber.bufs ?? [])
+          const buf = Buffer.concat(rxSink.bufs ?? [])
           if (buf.length >= len) {
             this.clearRxBufs()
-            rxSubscriber.bufs.push(buf.subarray(len))
+            rxSink.bufs.push(buf.subarray(len))
             return buf.subarray(0, len)
           }
           await sleep(10)
@@ -184,8 +187,8 @@ export class Chameleon {
   }
 
   async readXmodem (): Promise<Buffer> {
-    const rxSubscriber = this.rxSubscriber
-    if (_.isNil(rxSubscriber)) throw new Error('rxSubscriber is undefined')
+    const rxSink = this.rxSink
+    if (_.isNil(rxSink)) throw new Error('rxSink is undefined')
 
     let bytesReceived: number = 0
     let packetCounter: number = 1
@@ -226,13 +229,13 @@ export class Chameleon {
 
   async writeLine<T = boolean> ({ line, timeout }: { line: string, timeout?: number }): Promise<RxReadResp<T>> {
     this.clearRxBufs()
-    await this.writeBuffer(Buffer.from(`${line}${CHAR.CR}`, 'ascii'))
+    await this.writeBuffer(Buffer.from(`${line}${CHAR.CRLF}`, 'ascii'))
     return await this.readLineTimeout({ timeout })
   }
 
   async writeXmodem (buf: Buffer): Promise<number> {
-    const rxSubscriber = this.rxSubscriber
-    if (_.isNil(rxSubscriber)) throw new Error('rxSubscriber is undefined')
+    const rxSink = this.rxSink
+    if (_.isNil(rxSink)) throw new Error('rxSink is undefined')
 
     let bytesSent: number = 0
     let packetCounter: number = 1
@@ -259,9 +262,7 @@ export class Chameleon {
   }
 
   async cmdExecOrFail<T = boolean> ({ line, timeout }: { line: string, args?: string, timeout?: number }): Promise<T> {
-    console.log(`cmdExecOrFail input = ${JSON.stringify({ line, timeout })}`)
     const resp = await this.writeLine<T>({ line, timeout })
-    console.log(`cmdExecOrFail resp = ${JSON.stringify(resp)}`)
     if (STATUS_CODES_FAILURE.has(resp.statusCode)) throw new Error(`Failed to exec ${JSON.stringify(line)}`)
     return resp.response
   }
@@ -324,7 +325,7 @@ export class Chameleon {
   }
 
   async cmdExecUpgrade (): Promise<void> {
-    await this.writeBuffer(Buffer.from(`${COMMAND.UPGRADE}${CHAR.CR}`, 'ascii'))
+    await this.writeBuffer(Buffer.from(`${COMMAND.UPGRADE}${CHAR.CRLF}`, 'ascii'))
   }
 
   async cmdGetMemSize (): Promise<number> {
@@ -518,11 +519,11 @@ export interface ChameleonSerialPort<I, O> {
   writable: WritableStream<O>
 }
 
-export class ChameleonRxSubscriber implements UnderlyingSink<Buffer> {
+export class ChameleonRxSink implements UnderlyingSink<Buffer> {
   bufs: Buffer[] = []
 
   async write (chunk: Buffer): Promise<void> {
-    this.bufs.push(chunk)
+    this.bufs.push(asBuffer(chunk))
   }
 }
 
@@ -604,6 +605,7 @@ export const STATUS_CODES_FAILURE = new Set([
 export enum CHAR {
   CR = '\r',
   LF = '\n',
+  CRLF = '\r\n',
   SUGGEST = '?',
   SET = '=',
   GET = '?',
