@@ -28,7 +28,7 @@ block content
     .form-group.mt-3
       label Choose connection method:
       select.form-control.form-control-sm(v-model="h.adapter")
-        option(value="ble") via Bluetooth (Android only)
+        option(value="ble") via BLE (PC &amp; Android, bond is required)
         option(value="usb") via USB Serial (PC only)
     .row.mx-n1(v-if="ready")
       .col-12.col-md-6.px-1.mt-2(v-for="setting, settingIdx of h.settings")
@@ -40,7 +40,7 @@ block content
             )
             h5.mb-0.flex-fill(@click="$set(settingCollapse, settingIdx, 1 - (settingCollapse[settingIdx] ?? 0))") Setting \#{{ settingIdx + 1 }}
             .btn-group.btn-group-sm.my-n2.mr-n2
-              button.btn.btn-outline-success(@click="btnWriteChameleon(setting)") Write
+              button.btn.btn-outline-success(@click="btnUploadAmiibos(setting)") Upload
               button.btn.btn-outline-success.dropdown-toggle.dropdown-toggle-split(type="button", data-toggle="dropdown")
               .dropdown-menu.dropdown-menu-right.py-0
                 button.dropdown-item.text-danger(type="button", @click="h.settings.splice(settingIdx, 1)") Delete
@@ -65,8 +65,8 @@ block content
                     small: .text-muted Click here to select amiibo.
                     small: .text-muted.text-monospace &nbsp;
           table.mb-0.table.table-bordered(v-else)
-            tr(v-for="row of _.chunk(_.map(setting, slot => getAmiiboByAmiiboId(slot.id)), 4)")
-              td.p-2(v-for="amiibo of row")
+            tr(v-for="row of _.chunk(_.map(setting, (slot, slotIdx) => [slotIdx, getAmiiboByAmiiboId(slot.id)]), 4)")
+              td.p-2(v-for="[slotIdx, amiibo] of row" @click="btnPickAmiibo(setting, slotIdx)")
                 .img-amiibo2(:style="`background-image: url(${amiibo?.image ?? ''})`")
     button.mt-3.btn.btn-block.btn-primary(@click="btnNewSetting") Add new setting
     button.mt-2.btn.btn-block.btn-outline-danger(@click="btnReset") Clear all settings
@@ -84,12 +84,20 @@ block content
               li.list-group-item.d-flex.p-2(
                 v-for="amiibo of filteredAmiibos"
                 @click="amiiboPicker.cb?.(amiibo.amiiboId)"
+                :class="['', 'active'][+(amiiboPicker.cur === amiibo.amiiboId)]"
               )
-                .img-amiibo1(:style="`background-image: url(${amiibo?.image})`")
-                .flex-fill.d-flex.flex-column.justify-content-between.ml-3
-                  h5.mb-1 {{ amiibo?.amiibo?.name }}
-                  small: .text-muted {{ amiibo?.gameSeries }}
-                  small: .text-muted.text-monospace {{ amiibo.amiiboId }}
+                template(v-if="amiiboPicker.cur === amiibo.amiiboId")
+                  .img-amiibo1(:style="`background-image: url(${amiibo?.image})`")
+                  .flex-fill.d-flex.flex-column.justify-content-between.ml-3
+                    h5.mb-1 {{ amiibo?.amiibo?.name }}
+                    small: .text-light {{ amiibo?.gameSeries }}
+                    small: .text-light.text-monospace {{ amiibo.amiiboId }}
+                template(v-else)
+                  .img-amiibo1(:style="`background-image: url(${amiibo?.image})`")
+                  .flex-fill.d-flex.flex-column.justify-content-between.ml-3
+                    h5.mb-1 {{ amiibo?.amiibo?.name }}
+                    small: .text-muted {{ amiibo?.gameSeries }}
+                    small: .text-muted.text-monospace {{ amiibo.amiiboId }}
               li.list-group-item.d-flex.p-2(v-if="filteredAmiibos.length === 0")
                 .flex-fill.text-center.py-3 Please enter any amiibo name or game to search.
 
@@ -499,13 +507,12 @@ block script
           }
         },
         async btnPickAmiibo (parent, key) {
-          console.log(parent, key)
           const $ref = window.jQuery(this.$refs.amiiboPicker)
           const newVal = await new Promise(resolve => {
             this.$set(this, 'amiiboPicker', {
               ...this.amiiboPicker,
               cb: resolve,
-              cur: parent?.key?.id,
+              cur: parent?.[key]?.id,
             })
             $ref.one('hide.bs.modal', () => resolve()).modal('show')
           })
@@ -522,18 +529,18 @@ block script
             Swal.fire({ icon: 'error', title: '發生錯誤', text: err.message })
           }
         },
-        async btnWriteChameleon (setting) {
+        async btnUploadAmiibos (setting) {
           try {
             let successed = 0
-            this.showLoading('Writing', 'waiting for connection...')
-            await this.chameleon.connect()
+            this.showLoading('Connecting...', 'Waiting for connection...')
+            if (!this.chameleon.isConnected()) await this.chameleon.connect()
             for (let [slotIdx, slot] of _.toPairs(setting)) {
               try {
-                if (!this.chameleon.isConnected()) break
+                if (!this.chameleon.isConnected()) throw new Error('disconnected')
                 const amiiboId = slot.id
                 slotIdx = _.toInteger(slotIdx) + 1
                 if (!amiiboId) continue
-                this.showLoading(`Writing slot #${slotIdx}...`, `Successed: ${successed}`)
+                this.showLoading(`Uploading...`, `Current: slot \#${slotIdx}, Successed: ${successed}`)
                 console.log(`slotIdx = ${slotIdx}, amiiboId = ${amiiboId}`)
                 const tag = AmiiboNtag215.fromAmiiboId(amiiboId)
                 await this.chameleon.cmdSetSetting(`${slotIdx}`)
@@ -545,10 +552,10 @@ block script
                 console.error(err)
               }
             }
-            await Swal.fire({ icon: 'success', title: 'Write result', text: `${successed} slots write successfully!` })
+            await Swal.fire({ icon: 'success', title: 'Upload Result', text: `${successed} slots upload successfully!` })
           } catch (err) {
             console.error(err)
-            await Swal.fire({ icon: 'error', title: 'Failed to write', text: err.message })
+            await Swal.fire({ icon: 'error', title: 'Failed to upload', text: err.message })
           }
         },
         async btnReset (confirm = true) {

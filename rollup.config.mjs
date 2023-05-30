@@ -1,11 +1,11 @@
 import _ from 'lodash'
 import { nodeResolve } from '@rollup/plugin-node-resolve'
 import commonjs from '@rollup/plugin-commonjs'
-import json from '@rollup/plugin-json'
 import nodePolyfills from 'rollup-plugin-polyfill-node'
 import pkg from './package.json' assert { type: 'json' }
 import terser from '@rollup/plugin-terser'
 import typescript from '@rollup/plugin-typescript'
+import versionInjector from 'rollup-plugin-version-injector'
 
 const external = [
   ..._.keys(pkg.dependencies),
@@ -18,12 +18,18 @@ const globals = {
   lodash: '_',
 }
 
+const versionInjectorPlugin = versionInjector({
+  injectInTags: {
+    fileRegexp: /\.(js|mjs|cjs|html|css)$/,
+  },
+})
+
 export default [
   // src/index.ts
   {
     external,
     input: 'src/index.ts',
-    plugins: [typescript(), nodeResolve({ browser: true }), commonjs(), nodePolyfills(), json()],
+    plugins: [typescript(), nodeResolve({ browser: true }), commonjs(), nodePolyfills(), versionInjectorPlugin],
     output: [
       { file: 'dist/es/index.mjs', format: 'es' },
       { file: 'dist/cjs/index.cjs', format: 'cjs' },

@@ -11,12 +11,6 @@ import {
   WritableStream,
 } from 'web-streams-polyfill'
 
-// serv: 51510001-7969-6473-6f40-6b6f6c6c6957
-// send: 51510002-7969-6473-6f40-6b6f6c6c6957
-// recv: 51510003-7969-6473-6f40-6b6f6c6c6957
-// ctrl: 51510004-7969-6473-6f40-6b6f6c6c6957
-// tiny serv: 51510004-7969-6473-6f40-6b6f6c6c6957
-
 const BLESERIAL_FILTERS = [
   { name: 'ChameleonTiny' },
 ]
@@ -127,11 +121,11 @@ export default class ChameleonWebbleAdapter implements ChameleonPlugin {
       await next()
       if (_.isNil(this.device)) return
       if (!_.isNil(this.ctrl)) {
-        await this.ctrl.stopNotifications()
+        if (gattIsConnected()) await this.ctrl.stopNotifications()
         delete this.ctrl
       }
       if (!_.isNil(this.recv)) {
-        await this.recv.stopNotifications()
+        if (gattIsConnected()) await this.recv.stopNotifications()
         delete this.recv
         delete this.rxSource
       }
@@ -187,29 +181,11 @@ class ChameleonWebbleAdapterRxSource implements UnderlyingSource<Buffer> {
   start (controller: ReadableStreamDefaultController<Buffer>): void { this.controller = controller }
 
   onNotify (event: any): void {
-    const arrayBuffer = event?.target?.value?.buffer as ArrayBuffer
-    this.bufs.push(asBuffer(arrayBuffer))
-    while (this.bufs.length > 0) {
-      let buf = Buffer.concat(this.bufs)
-      const indexStart = buf.indexOf(0xA5)
-      if (indexStart < 0) break // start (0xA5) not found
-      buf = buf.subarray(indexStart) // ignore data before start
-      if (!this.isBlePacket(buf)) {
-        this.bufs.splice(0, this.bufs.length, buf.subarray(1)) // ignore the start byte
-        continue
-      }
-      this.bufs.splice(0, this.bufs.length, buf.subarray(buf[2] + 4)) // push the rest bytes back to bufs
-      buf = buf.subarray(0, buf[2] + 4)
-      if (buf[1] === 0x75) { // 0x75 is TEXT_HEX
-        this.controller?.enqueue(buf.subarray(4))
-        this.adapter.chameleon?.verboseLog(`enqueue = ${buf.subarray(4).toString('hex')}`)
-      }
-    }
-  }
-
-  isBlePacket (buf: Buffer): boolean {
-    if (buf[0] !== 0xA5 || (buf[2] + 4) !== buf.length) return false // check packet head and check length
-    return (_.sum(buf.subarray(0, buf[2] + 4)) & 0xFF) === 0 // checksum
+    const buf = asBuffer(event?.target?.value?.buffer as ArrayBuffer)
+    this.adapter.chameleon?.verboseLog(`onNotify = ${buf.subarray(0, 4).toString('hex')} ${buf.subarray(4).toString('hex')}`)
+    if (buf[0] !== BLE_BYTES.SOH || buf[1] !== BLE_BYTES.CMD_TEXT || buf[2] + 4 !== buf.length) return
+    if ((_.sum(buf) & 0xFF) !== 0) return // checksum mismatch
+    this.controller?.enqueue(buf.subarray(4))
   }
 }
 
@@ -231,8 +207,13 @@ class ChameleonWebbleAdapterTxSink implements UnderlyingSink<Buffer> {
       buf2[2] = buf1.length
       buf1.copy(buf2, 4)
       buf2[3] = 256 - (_.sum(buf2) & 0xFF)
-      this.adapter.chameleon?.verboseLog(`writeValue = ${buf2.toString('hex')}`)
+      this.adapter.chameleon?.verboseLog(`bleWrite = ${buf2.subarray(0, 4).toString('hex')} ${buf2.subarray(4).toString('hex')}`)
       await this.adapter.send?.writeValueWithoutResponse(buf2.buffer)
     }
   }
+}
+
+enum BLE_BYTES {
+  SOH = 0xA5,
+  CMD_TEXT = 0x75,
 }

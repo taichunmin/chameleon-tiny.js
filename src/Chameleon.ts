@@ -103,11 +103,11 @@ export class Chameleon {
     })
   }
 
-  clearRxBufs (): void {
-    this.rxSink?.bufs.splice(0, this.rxSink.bufs.length)
+  clearRxBufs (): Buffer[] {
+    return this.rxSink?.bufs.splice(0, this.rxSink.bufs.length) ?? []
   }
 
-  async readLineTimeout<T> ({ timeout }: { timeout?: number }): Promise<RxReadResp<T>> {
+  async readLineTimeout ({ timeout }: { timeout?: number }): Promise<string> {
     interface Context {
       startedAt?: number
       nowts?: number
@@ -116,39 +116,47 @@ export class Chameleon {
     return await this.invokeHook('readLineTimeout', { timeout }, async (ctx: Context, next) => {
       try {
         if (!this.isConnected()) await this.connect()
-        const rxSink = this.rxSink
-        if (_.isNil(rxSink)) throw new Error('rxSink is undefined')
-        const resp: Partial<RxReadResp<string | boolean>> = {}
+        if (_.isNil(this.rxSink)) throw new Error('rxSink is undefined')
         ctx.timeout = ctx.timeout ?? READ_DEFAULT_TIMEOUT
         ctx.startedAt = Date.now()
         while (true) {
           if (!this.isConnected()) throw new Error('device disconnected')
           ctx.nowts = Date.now()
-          if (ctx.nowts > ctx.startedAt + ctx.timeout) throw new Error(`readLineTimeout ${ctx.timeout}ms`)
-          while (rxSink.bufs?.length > 0) {
-            const buf = Buffer.concat(rxSink.bufs)
-            const indexEol = buf.indexOf(CHAR.LF)
-            if (indexEol < 0) break // line ending not found
-
-            this.clearRxBufs()
-            rxSink.bufs.push(buf.subarray(indexEol + 1))
-            const text = _.trim(buf.subarray(0, indexEol).toString('ascii'))
-
-            if (resp.statusCode === STATUS_CODE.OK_WITH_TEXT) {
-              resp.response = text
-              this.verboseLog(`Resp: ${resp.response}`)
-              return resp
-            }
-            const [statusCode, statusText] = _.map(text.split(':', 2), _.trim)
-            resp.statusCode = _.parseInt(statusCode)
-            resp.statusText = statusText
-            if (resp.statusCode === STATUS_CODE.OK_WITH_TEXT) continue // need to read next buffer
-            else if (STATUS_CODES_SUCCESS.has(resp.statusCode)) resp.response = true
-            else if (STATUS_CODES_FAILURE.has(resp.statusCode)) resp.response = false
-            return resp
-          }
+          if (ctx.nowts > ctx.startedAt + ctx.timeout) throw new Error(`readBytesTimeout ${ctx.timeout}ms`)
+          let buf = Buffer.concat(this.clearRxBufs())
+          const indexEol = buf.indexOf(ASCII.CR)
+          if (indexEol >= 0) {
+            const text = buf.subarray(0, indexEol).toString('ascii')
+            buf = buf.subarray(indexEol + 1)
+            if (buf[0] === ASCII.LF) buf = buf.subarray(1) // trim LF
+            if (buf.length > 0) this.rxSink.bufs.unshift(buf)
+            return text
+          } else if (buf.length > 0) this.rxSink?.bufs.unshift(buf)
           await sleep(10)
         }
+      } catch (err) {
+        throw _.set(new Error('Failed to read line'), 'originalError', err)
+      }
+    }) as string
+  }
+
+  async readRespTimeout<T> ({ timeout }: { timeout?: number }): Promise<RxReadResp<T>> {
+    interface Context {
+      startedAt?: number
+      nowts?: number
+      timeout?: number
+    }
+    return await this.invokeHook('readRespTimeout', { timeout }, async (ctx: Context, next) => {
+      try {
+        const status = await this.readLineTimeout({ timeout: ctx.timeout })
+        if (status.length < 1) throw new Error('failed to read status')
+        const resp: Partial<RxReadResp<string | boolean>> = {}
+        const [statusCode, statusText] = _.map(status.split(':', 2), _.trim)
+        resp.statusCode = _.parseInt(statusCode)
+        resp.statusText = statusText
+        if (resp.statusCode !== STATUS_CODE.OK_WITH_TEXT) resp.response = STATUS_CODES_SUCCESS.has(resp.statusCode)
+        else resp.response = await this.readLineTimeout({ timeout: ctx.timeout })
+        return resp
       } catch (err) {
         throw _.set(new Error('Failed to read response'), 'originalError', err)
       }
@@ -161,23 +169,21 @@ export class Chameleon {
       nowts?: number
       timeout?: number
     }
-    const rxSink = this.rxSink
-    if (_.isNil(rxSink)) throw new Error('rxSink is undefined')
     return await this.invokeHook('readBytesTimeout', { timeout }, async (ctx: Context, next) => {
       try {
         if (!this.isConnected()) await this.connect()
+        if (_.isNil(this.rxSink)) throw new Error('rxSink is undefined')
         ctx.timeout = ctx.timeout ?? READ_DEFAULT_TIMEOUT
         ctx.startedAt = Date.now()
         while (true) {
           if (!this.isConnected()) throw new Error('device disconnected')
           ctx.nowts = Date.now()
           if (ctx.nowts > ctx.startedAt + ctx.timeout) throw new Error(`readBytesTimeout ${ctx.timeout}ms`)
-          const buf = Buffer.concat(rxSink.bufs ?? [])
+          const buf = Buffer.concat(this.clearRxBufs())
           if (buf.length >= len) {
-            this.clearRxBufs()
-            rxSink.bufs.push(buf.subarray(len))
+            if (buf.length > len) this.rxSink?.bufs.unshift(buf.subarray(len))
             return buf.subarray(0, len)
-          }
+          } else if (buf.length > 0) this.rxSink?.bufs.unshift(buf)
           await sleep(10)
         }
       } catch (err) {
@@ -193,23 +199,22 @@ export class Chameleon {
     let bytesReceived: number = 0
     let packetCounter: number = 1
     const bufs = []
-    this.clearRxBufs()
     const startedAt = Date.now()
     this.verboseLog('read XMODEM started')
 
     await this.writeBuffer(Buffer.from([XMODEM_BYTE.NAK]))
     while (true) {
       try {
-        const pktId = (await this.readBytesTimeout({ len: 1 }))[0]
-        if (_.includes([XMODEM_BYTE.CAN, XMODEM_BYTE.ESC], pktId)) break // cancel
-        if (pktId === XMODEM_BYTE.EOT) { // Transmission finished
+        const pktType = (await this.readBytesTimeout({ len: 1 }))[0]
+        if (_.includes([XMODEM_BYTE.CAN, XMODEM_BYTE.ESC], pktType)) break // cancel
+        if (pktType === XMODEM_BYTE.EOT) { // Transmission finished
           await this.writeBuffer(Buffer.from([XMODEM_BYTE.ACK]))
           break
         }
-        if (pktId !== XMODEM_BYTE.SOH) continue // Ignore other bytes
+        if (pktType !== XMODEM_BYTE.SOH) continue // Ignore other bytes
 
         const pktCnt = await this.readBytesTimeout({ len: 2 })
-        if (pktCnt[0] + pktCnt[1] !== 0xFF) throw new Error(`invalid pktCnt = ${pktCnt.toString('hex')}`)
+        if (pktCnt[0] + pktCnt[1] !== 0xFF) throw new Error(`invalid pktCnt = 0x${pktCnt.toString('hex')}`)
         const packet = await this.readBytesTimeout({ len: XMODEM_BLOCK_SIZE + 1 })
         if (packet[XMODEM_BLOCK_SIZE] !== _.sum(packet.subarray(0, XMODEM_BLOCK_SIZE)) % 256) throw new Error('checksum mismatch')
         if (pktCnt[0] === packetCounter) bufs.push(packet.subarray(0, XMODEM_BLOCK_SIZE)) // ignore retransmission
@@ -218,7 +223,6 @@ export class Chameleon {
         await this.writeBuffer(Buffer.from([XMODEM_BYTE.ACK]))
       } catch (err) {
         this.verboseLog(`readXmodem error: ${err.message as string}`)
-        this.clearRxBufs()
         await this.writeBuffer(Buffer.from([XMODEM_BYTE.NAK]))
       }
     }
@@ -230,7 +234,7 @@ export class Chameleon {
   async writeLine<T = boolean> ({ line, timeout }: { line: string, timeout?: number }): Promise<RxReadResp<T>> {
     this.clearRxBufs()
     await this.writeBuffer(Buffer.from(`${line}${CHAR.CRLF}`, 'ascii'))
-    return await this.readLineTimeout({ timeout })
+    return await this.readRespTimeout({ timeout })
   }
 
   async writeXmodem (buf: Buffer): Promise<number> {
@@ -239,7 +243,7 @@ export class Chameleon {
 
     let bytesSent: number = 0
     let packetCounter: number = 1
-    this.verboseLog('Waiting for XMODEM Connection')
+    this.verboseLog('writeXmodem: Waiting for NAK')
 
     // Timeout or unexpected char received
     if ((await this.readBytesTimeout({ len: 1 }))[0] !== XMODEM_BYTE.NAK) return 0
@@ -258,6 +262,7 @@ export class Chameleon {
     }
     await this.writeBuffer(Buffer.from([XMODEM_BYTE.EOT]))
     await this.readBytesTimeout({ len: 1 })
+    this.verboseLog(`writeXmodem: ${bytesSent} bytes sent.`)
     return bytesSent
   }
 
@@ -508,7 +513,7 @@ export class Chameleon {
 
   async getCmdSuggestions (cmd: COMMAND): Promise<string[]> {
     const resp = await this.writeLine<string>({ line: `${cmd}${CHAR.SET}${CHAR.SUGGEST}` })
-    if (STATUS_CODES_FAILURE.has(resp.statusCode)) throw new Error(`Failed to set ${cmd}`)
+    if (resp.statusCode !== STATUS_CODE.OK_WITH_TEXT) throw new Error(`Failed to getCmdSuggestions ${cmd}`)
     return resp.response.split(',')
   }
 }
@@ -522,7 +527,7 @@ export interface ChameleonSerialPort<I, O> {
 export class ChameleonRxSink implements UnderlyingSink<Buffer> {
   bufs: Buffer[] = []
 
-  async write (chunk: Buffer): Promise<void> {
+  write (chunk: Buffer): void {
     this.bufs.push(asBuffer(chunk))
   }
 }
@@ -603,13 +608,16 @@ export const STATUS_CODES_FAILURE = new Set([
 ])
 
 export enum CHAR {
-  CR = '\r',
-  LF = '\n',
   CRLF = '\r\n',
   SUGGEST = '?',
   SET = '=',
   GET = '?',
   ESCAPE = '\x1B', // ASCII 27
+}
+
+export enum ASCII {
+  CR = 0x0D,
+  LF = 0x0A,
 }
 
 interface RxReadResp<T> {
