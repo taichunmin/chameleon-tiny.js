@@ -4,7 +4,7 @@ import { asBuffer, middlewareCompose, sleep, type MiddlewareComposeFn } from './
 import { type ReadableStream, type UnderlyingSink, WritableStream } from 'web-streams-polyfill'
 
 const READ_DEFAULT_TIMEOUT = 5e3
-const XMODEM_BLOCK_SIZE = 128
+const XMODEM_SECTOR_SIZE = 128
 
 export class Chameleon {
   hooks: Record<string, MiddlewareComposeFn[]>
@@ -206,7 +206,7 @@ export class Chameleon {
     while (true) {
       try {
         const pktType = (await this.readBytesTimeout({ len: 1 }))[0]
-        if (_.includes([XMODEM_BYTE.CAN, XMODEM_BYTE.ESC], pktType)) break // cancel
+        if (_.includes([XMODEM_BYTE.CAN], pktType)) break // cancel
         if (pktType === XMODEM_BYTE.EOT) { // Transmission finished
           await this.writeBuffer(Buffer.from([XMODEM_BYTE.ACK]))
           break
@@ -215,10 +215,10 @@ export class Chameleon {
 
         const pktCnt = await this.readBytesTimeout({ len: 2 })
         if (pktCnt[0] + pktCnt[1] !== 0xFF) throw new Error(`invalid pktCnt = 0x${pktCnt.toString('hex')}`)
-        const packet = await this.readBytesTimeout({ len: XMODEM_BLOCK_SIZE + 1 })
-        if (packet[XMODEM_BLOCK_SIZE] !== _.sum(packet.subarray(0, XMODEM_BLOCK_SIZE)) % 256) throw new Error('checksum mismatch')
-        if (pktCnt[0] === packetCounter) bufs.push(packet.subarray(0, XMODEM_BLOCK_SIZE)) // ignore retransmission
-        bytesReceived += XMODEM_BLOCK_SIZE
+        const packet = await this.readBytesTimeout({ len: XMODEM_SECTOR_SIZE + 1 })
+        if (packet[XMODEM_SECTOR_SIZE] !== _.sum(packet.subarray(0, XMODEM_SECTOR_SIZE)) % 256) throw new Error('checksum mismatch')
+        if (pktCnt[0] === packetCounter) bufs.push(packet.subarray(0, XMODEM_SECTOR_SIZE)) // ignore retransmission
+        bytesReceived += XMODEM_SECTOR_SIZE
         packetCounter++
         await this.writeBuffer(Buffer.from([XMODEM_BYTE.ACK]))
       } catch (err) {
@@ -246,19 +246,19 @@ export class Chameleon {
     this.verboseLog('writeXmodem: Waiting for NAK')
 
     // Timeout or unexpected char received
-    if ((await this.readBytesTimeout({ len: 1 }))[0] !== XMODEM_BYTE.NAK) return 0
+    if ((await this.readBytesTimeout({ len: 1, timeout: 1e4 }))[0] !== XMODEM_BYTE.NAK) return 0
 
     while (bytesSent < buf.length) {
-      const packet = Buffer.alloc(XMODEM_BLOCK_SIZE + 4)
+      const packet = Buffer.alloc(XMODEM_SECTOR_SIZE + 4)
       packet[0] = XMODEM_BYTE.SOH
       packet[1] = packetCounter
       packet[2] = 0xFF - packetCounter
-      buf.copy(packet, 3, bytesSent, bytesSent + XMODEM_BLOCK_SIZE)
-      packet[XMODEM_BLOCK_SIZE + 3] = _.sum(packet.subarray(3, XMODEM_BLOCK_SIZE + 3))
+      buf.copy(packet, 3, bytesSent, bytesSent + XMODEM_SECTOR_SIZE)
+      packet[XMODEM_SECTOR_SIZE + 3] = _.sum(packet.subarray(3, XMODEM_SECTOR_SIZE + 3))
       await this.writeBuffer(packet)
       if ((await this.readBytesTimeout({ len: 1 }))[0] !== XMODEM_BYTE.ACK) continue // resend
       packetCounter++
-      bytesSent += XMODEM_BLOCK_SIZE
+      bytesSent += XMODEM_SECTOR_SIZE
     }
     await this.writeBuffer(Buffer.from([XMODEM_BYTE.EOT]))
     await this.readBytesTimeout({ len: 1 })
@@ -453,12 +453,12 @@ export class Chameleon {
 
   // async cmdExecParamSendRaw (): Promise<void> {
   //   await this.cmdExecOrFail({ line: COMMAND.SEND_RAW })
-  //   // TODO: implemet
+  //   // TODO: implement
   // }
 
   // async cmdExecParamSend (): Promise<void> {
   //   await this.cmdExecOrFail({ line: COMMAND.SEND })
-  //   // TODO: implemet
+  //   // TODO: implement
   // }
 
   async cmdExecGetUid (): Promise<string> {
@@ -467,7 +467,7 @@ export class Chameleon {
 
   async cmdExecDumpMFU (): Promise<string> {
     return await this.cmdExecOrFail<string>({ line: COMMAND.DUMP_MFU })
-    // TODO: implemet
+    // TODO: implement
   }
 
   async cmdExecCloneMFU (): Promise<string> {
@@ -627,13 +627,11 @@ interface RxReadResp<T> {
 }
 
 export enum XMODEM_BYTE {
-  ACK = 0x06,
-  CAN = 0x18,
-  EOF = 0x1A,
-  EOT = 0x04,
-  ESC = 0x1B,
-  NAK = 0x15,
   SOH = 0x01,
+  EOT = 0x04,
+  ACK = 0x06,
+  NAK = 0x15,
+  CAN = 0x18,
 }
 
 export interface PluginInstallContext {
