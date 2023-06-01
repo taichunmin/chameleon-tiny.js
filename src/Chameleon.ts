@@ -4,6 +4,7 @@ import { asBuffer, middlewareCompose, sleep, type MiddlewareComposeFn } from './
 import { type ReadableStream, type UnderlyingSink, WritableStream } from 'web-streams-polyfill'
 
 const READ_DEFAULT_TIMEOUT = 5e3
+const XMODEM_NAK_WAIT_COUNT = 60
 const XMODEM_SECTOR_SIZE = 128
 
 export class Chameleon {
@@ -59,7 +60,7 @@ export class Chameleon {
           })
 
         // Send escape key to force clearing the Chameleon's input buffer
-        await this.writeBuffer(Buffer.from(CHAR.ESCAPE, 'ascii'))
+        await this.writeEscape()
         this.verboseLog('connected')
 
         // Try to retrieve chameleons version information and supported confs
@@ -103,6 +104,10 @@ export class Chameleon {
     })
   }
 
+  async writeEscape (): Promise<void> {
+    await this.writeBuffer(Buffer.from(CHAR.ESCAPE, 'ascii'))
+  }
+
   clearRxBufs (): Buffer[] {
     return this.rxSink?.bufs.splice(0, this.rxSink.bufs.length) ?? []
   }
@@ -130,6 +135,7 @@ export class Chameleon {
             buf = buf.subarray(indexEol + 1)
             if (buf[0] === ASCII.LF) buf = buf.subarray(1) // trim LF
             if (buf.length > 0) this.rxSink.bufs.unshift(buf)
+            this.verboseLog(text)
             return text
           } else if (buf.length > 0) this.rxSink?.bufs.unshift(buf)
           await sleep(10)
@@ -150,12 +156,23 @@ export class Chameleon {
       try {
         const status = await this.readLineTimeout({ timeout: ctx.timeout })
         if (status.length < 1) throw new Error('failed to read status')
-        const resp: Partial<RxReadResp<string | boolean>> = {}
+        const resp: Partial<RxReadResp<string | boolean | null>> = {}
         const [statusCode, statusText] = _.map(status.split(':', 2), _.trim)
         resp.statusCode = _.parseInt(statusCode)
         resp.statusText = statusText
-        if (resp.statusCode !== STATUS_CODE.OK_WITH_TEXT) resp.response = STATUS_CODES_SUCCESS.has(resp.statusCode)
-        else resp.response = await this.readLineTimeout({ timeout: ctx.timeout })
+        switch (resp.statusCode) {
+          case STATUS_CODE.OK_WITH_TEXT:
+            resp.response = await this.readLineTimeout({ timeout: ctx.timeout })
+            break
+          case STATUS_CODE.FALSE:
+            resp.response = false
+            break
+          case STATUS_CODE.TRUE:
+            resp.response = true
+            break
+          default:
+            resp.response = null
+        }
         return resp
       } catch (err) {
         throw _.set(new Error('Failed to read response'), 'originalError', err)
@@ -193,6 +210,7 @@ export class Chameleon {
   }
 
   async readXmodem (): Promise<Buffer> {
+    // https://github.com/RfidResearchGroup/ChameleonMini/blob/proxgrind/Firmware/Chameleon-Mini/Terminal/XModem.c
     const rxSink = this.rxSink
     if (_.isNil(rxSink)) throw new Error('rxSink is undefined')
 
@@ -200,13 +218,13 @@ export class Chameleon {
     let packetCounter: number = 1
     const bufs = []
     const startedAt = Date.now()
-    this.verboseLog('read XMODEM started')
+    this.verboseLog('readXmodem: started')
 
     await this.writeBuffer(Buffer.from([XMODEM_BYTE.NAK]))
     while (true) {
       try {
         const pktType = (await this.readBytesTimeout({ len: 1 }))[0]
-        if (_.includes([XMODEM_BYTE.CAN], pktType)) break // cancel
+        if (pktType === XMODEM_BYTE.CAN) break // cancel
         if (pktType === XMODEM_BYTE.EOT) { // Transmission finished
           await this.writeBuffer(Buffer.from([XMODEM_BYTE.ACK]))
           break
@@ -214,26 +232,27 @@ export class Chameleon {
         if (pktType !== XMODEM_BYTE.SOH) continue // Ignore other bytes
 
         const pktCnt = await this.readBytesTimeout({ len: 2 })
-        if (pktCnt[0] + pktCnt[1] !== 0xFF) throw new Error(`invalid pktCnt = 0x${pktCnt.toString('hex')}`)
+        if (pktCnt[0] + pktCnt[1] !== 0xFF) throw new Error(`readXmodem: invalid pktCnt = 0x${pktCnt.toString('hex')}`)
         const packet = await this.readBytesTimeout({ len: XMODEM_SECTOR_SIZE + 1 })
-        if (packet[XMODEM_SECTOR_SIZE] !== _.sum(packet.subarray(0, XMODEM_SECTOR_SIZE)) % 256) throw new Error('checksum mismatch')
+        if (packet[XMODEM_SECTOR_SIZE] !== _.sum(packet.subarray(0, XMODEM_SECTOR_SIZE)) % 256) throw new Error('readXmodem: checksum mismatch')
         if (pktCnt[0] === packetCounter) bufs.push(packet.subarray(0, XMODEM_SECTOR_SIZE)) // ignore retransmission
         bytesReceived += XMODEM_SECTOR_SIZE
         packetCounter++
         await this.writeBuffer(Buffer.from([XMODEM_BYTE.ACK]))
       } catch (err) {
-        this.verboseLog(`readXmodem error: ${err.message as string}`)
+        this.verboseLog(`readXmodem: error = ${err.message as string}`)
         await this.writeBuffer(Buffer.from([XMODEM_BYTE.NAK]))
       }
     }
     const timeDelta = Date.now() - startedAt
-    this.verboseLog(`${bytesReceived} bytes recieved in ${timeDelta}ms`)
+    this.verboseLog(`readXmodem: ${bytesReceived} bytes recieved in ${timeDelta}ms`)
     return Buffer.concat(bufs)
   }
 
-  async writeLine<T = boolean> ({ line, timeout }: { line: string, timeout?: number }): Promise<RxReadResp<T>> {
+  async writeLineReadResp<T = null> ({ line, timeout }: { line: string, timeout?: number }): Promise<RxReadResp<T>> {
+    this.verboseLog(line)
     this.clearRxBufs()
-    await this.writeBuffer(Buffer.from(`${line}${CHAR.CRLF}`, 'ascii'))
+    await this.writeBuffer(Buffer.from(`${line}${CHAR.CR}`, 'ascii'))
     return await this.readRespTimeout({ timeout })
   }
 
@@ -246,7 +265,11 @@ export class Chameleon {
     this.verboseLog('writeXmodem: Waiting for NAK')
 
     // Timeout or unexpected char received
-    if ((await this.readBytesTimeout({ len: 1, timeout: 1e4 }))[0] !== XMODEM_BYTE.NAK) return 0
+    for (let i = 0; i < XMODEM_NAK_WAIT_COUNT; i++) {
+      const bytes = await this.readBytesTimeout({ len: 1, timeout: 200 }).catch(() => Buffer.alloc(0))
+      if (bytes.length > 0 && bytes[0] === XMODEM_BYTE.NAK) break
+      if (i === XMODEM_NAK_WAIT_COUNT - 1) throw new Error('Xmodem write timeout')
+    }
 
     while (bytesSent < buf.length) {
       const packet = Buffer.alloc(XMODEM_SECTOR_SIZE + 4)
@@ -267,20 +290,20 @@ export class Chameleon {
   }
 
   async cmdExecOrFail<T = boolean> ({ line, timeout }: { line: string, args?: string, timeout?: number }): Promise<T> {
-    const resp = await this.writeLine<T>({ line, timeout })
+    const resp = await this.writeLineReadResp<T>({ line, timeout })
     if (STATUS_CODES_FAILURE.has(resp.statusCode)) throw new Error(`Failed to exec ${JSON.stringify(line)}`)
     return resp.response
   }
 
-  async cmdGetOrFail ({ cmd, timeout }: { cmd: COMMAND, timeout?: number }): Promise<string> {
-    const resp = await this.writeLine<string>({ line: `${cmd}${CHAR.GET}`, timeout })
-    if (resp.statusCode !== STATUS_CODE.OK_WITH_TEXT) throw new Error(`Failed to get ${cmd}`)
+  async cmdGetOrFail<T = string> ({ cmd, timeout }: { cmd: COMMAND, timeout?: number }): Promise<T> {
+    const resp = await this.writeLineReadResp<T>({ line: `${cmd}${CHAR.GET}`, timeout })
+    if (STATUS_CODES_FAILURE.has(resp.statusCode)) throw new Error(`Failed to get ${cmd}`)
     return resp.response
   }
 
   async cmdSetOrFail ({ cmd, val, timeout }: { cmd: COMMAND, val: string, timeout?: number }): Promise<void> {
     if (val === CHAR.SUGGEST) throw new Error(`val cannot be ${CHAR.SUGGEST}`)
-    const resp = await this.writeLine<string>({ line: `${cmd}${CHAR.SET}${val}`, timeout })
+    const resp = await this.writeLineReadResp({ line: `${cmd}${CHAR.SET}${val}`, timeout })
     if (STATUS_CODES_FAILURE.has(resp.statusCode)) throw new Error(`Failed to set ${cmd}`)
   }
 
@@ -314,13 +337,13 @@ export class Chameleon {
   }
 
   async cmdExecUpload (buf: Buffer): Promise<number> {
-    const resp = await this.writeLine({ line: COMMAND.UPLOAD })
+    const resp = await this.writeLineReadResp({ line: COMMAND.UPLOAD })
     if (resp.statusCode !== STATUS_CODE.WAITING_FOR_XMODEM) throw new Error('Failed to switch to XModem')
     return await this.writeXmodem(buf)
   }
 
   async cmdExecDownload (): Promise<Buffer> {
-    const resp = await this.writeLine({ line: COMMAND.DOWNLOAD })
+    const resp = await this.writeLineReadResp({ line: COMMAND.DOWNLOAD })
     if (resp.statusCode !== STATUS_CODE.WAITING_FOR_XMODEM) throw new Error('Failed to switch to XModem')
     return await this.readXmodem()
   }
@@ -330,7 +353,7 @@ export class Chameleon {
   }
 
   async cmdExecUpgrade (): Promise<void> {
-    await this.writeBuffer(Buffer.from(`${COMMAND.UPGRADE}${CHAR.CRLF}`, 'ascii'))
+    await this.writeBuffer(Buffer.from(`${COMMAND.UPGRADE}${CHAR.CR}`, 'ascii'))
   }
 
   async cmdGetMemSize (): Promise<number> {
@@ -402,7 +425,7 @@ export class Chameleon {
   }
 
   async cmdExecLogDownload (): Promise<Buffer> {
-    const resp = await this.writeLine({ line: COMMAND.LOGDOWNLOAD })
+    const resp = await this.writeLineReadResp({ line: COMMAND.LOGDOWNLOAD })
     if (resp.statusCode !== STATUS_CODE.WAITING_FOR_XMODEM) throw new Error('Failed to switch to XModem')
     return await this.readXmodem()
   }
@@ -435,7 +458,7 @@ export class Chameleon {
     await this.cmdExecOrFail({ line: COMMAND.RECALL })
   }
 
-  async cmdGetCharging (): Promise<string> {
+  async cmdGetCharging (): Promise<boolean> {
     return await this.cmdGetOrFail({ cmd: COMMAND.CHARGING })
   }
 
@@ -487,6 +510,22 @@ export class Chameleon {
     return await this.cmdGetOrFail({ cmd: COMMAND.TIMEOUT })
   }
 
+  async cmdSetAtqa (val: string): Promise<void> {
+    await this.cmdSetOrFail({ cmd: COMMAND.ATQA, val })
+  }
+
+  async cmdGetAtqa (): Promise<string> {
+    return await this.cmdGetOrFail({ cmd: COMMAND.ATQA })
+  }
+
+  async cmdSetSak (val: string): Promise<void> {
+    await this.cmdSetOrFail({ cmd: COMMAND.SAK, val })
+  }
+
+  async cmdGetSak (): Promise<string> {
+    return await this.cmdGetOrFail({ cmd: COMMAND.SAK })
+  }
+
   async cmdSetThreshold (val: string): Promise<void> {
     await this.cmdSetOrFail({ cmd: COMMAND.THRESHOLD, val })
   }
@@ -512,7 +551,7 @@ export class Chameleon {
   }
 
   async getCmdSuggestions (cmd: COMMAND): Promise<string[]> {
-    const resp = await this.writeLine<string>({ line: `${cmd}${CHAR.SET}${CHAR.SUGGEST}` })
+    const resp = await this.writeLineReadResp<string>({ line: `${cmd}${CHAR.SET}${CHAR.SUGGEST}` })
     if (resp.statusCode !== STATUS_CODE.OK_WITH_TEXT) throw new Error(`Failed to getCmdSuggestions ${cmd}`)
     return resp.response.split(',')
   }
@@ -608,6 +647,7 @@ export const STATUS_CODES_FAILURE = new Set([
 ])
 
 export enum CHAR {
+  CR = '\r',
   CRLF = '\r\n',
   SUGGEST = '?',
   SET = '=',
@@ -632,6 +672,7 @@ export enum XMODEM_BYTE {
   ACK = 0x06,
   NAK = 0x15,
   CAN = 0x18,
+  EOF = 0x1A,
 }
 
 export interface PluginInstallContext {

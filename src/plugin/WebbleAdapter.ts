@@ -61,44 +61,52 @@ export default class ChameleonWebbleAdapter implements ChameleonPlugin {
         if (_.isNil(this.device)) throw new Error('no device')
         chameleon.verboseLog(`device selected, name = ${this.device.name ?? 'null'}, id = ${this.device.id}`)
 
-        for (let i = 0; i < 50; i++) {
-          await this.device.gatt?.connect().catch(() => {})
-          if (gattIsConnected()) break
-          await sleep(50)
-        }
-        if (!gattIsConnected()) throw new Error('Failed to connect gatt')
-        this.device.addEventListener('gattserverdisconnected', () => { void chameleon.disconnect() })
-
         this.rxSource = new ChameleonWebbleAdapterRxSource(this)
         this.txSink = new ChameleonWebbleAdapterTxSink(this)
 
-        // find serv, send, recv, ctrl
-        const primaryServices = _.map(await this.device.gatt?.getPrimaryServices(), 'uuid')
-        for (const uuids of BLESERIAL_UUID) {
-          try {
-            if (!_.includes(primaryServices, uuids.serv)) continue
-            this.serv = await this.device.gatt?.getPrimaryService(uuids.serv)
-            this.send = await this.serv?.getCharacteristic(uuids.send)
-            this.recv = await this.serv?.getCharacteristic(uuids.recv)
-            this.recv?.addEventListener('characteristicvaluechanged', (event: any): void => this.rxSource?.onNotify(event))
-            await this.recv?.startNotifications()
+        for (let i = 0; i < 100; i++) {
+          this.chameleon?.verboseLog(`gatt connecting, retry = ${i}`)
+          if (!gattIsConnected()) await this.device.gatt?.connect().catch(err => { this.chameleon?.verboseLog(err.message) })
 
+          // find serv, send, recv, ctrl
+          const primaryServices = _.map(await this.device.gatt?.getPrimaryServices(), 'uuid')
+          for (const uuids of BLESERIAL_UUID) {
             try {
-              this.ctrl = await this.serv?.getCharacteristic(uuids.ctrl)
-              this.ctrl?.addEventListener('characteristicvaluechanged', (event: any): void => this.rxSource?.onNotify(event))
-              await this.ctrl?.startNotifications()
+              if (!_.includes(primaryServices, uuids.serv)) continue
+              this.serv = await this.device.gatt?.getPrimaryService(uuids.serv)
+              this.send = await this.serv?.getCharacteristic(uuids.send)
+              this.recv = await this.serv?.getCharacteristic(uuids.recv)
+              this.recv?.addEventListener('characteristicvaluechanged', (event: any): void => this.rxSource?.onNotify(event))
+              await this.recv?.startNotifications()
+
+              try {
+                this.ctrl = await this.serv?.getCharacteristic(uuids.ctrl)
+                this.ctrl?.addEventListener('characteristicvaluechanged', (event: any): void => this.rxSource?.onNotify(event))
+                await this.ctrl?.startNotifications()
+              } catch (err) {
+                delete this.ctrl
+              }
+
+              // try to write escape
+              await this.send?.writeValueWithoutResponse(Buffer.from('1B', 'hex').buffer)
             } catch (err) {
+              delete this.serv
+              delete this.send
+              delete this.recv
               delete this.ctrl
             }
 
-            chameleon.verboseLog(`gatt connected, serv = '${uuids.serv}', recv = '${uuids.recv}', send = '${uuids.send}', ctrl = '${_.isNil(this.ctrl) ? 'null' : uuids.send}'`)
-            this.isOpen = true
-            break
-          } catch (err) {
-            chameleon.verboseLog(`${err.message as string}, uuids = ${JSON.stringify(uuids)}`)
+            if (!_.isNil(this.send) && !_.isNil(this.recv)) {
+              chameleon.verboseLog(`gatt connected, serv = ${this.serv?.uuid ?? '?'}, recv = ${this.recv?.uuid ?? '?'}, send = ${this.send?.uuid ?? '?'}', ctrl = ${this.ctrl?.uuid ?? '?'}`)
+              this.isOpen = true
+              break
+            }
           }
+          if (this.isOpen) break
+          await sleep(100)
         }
-        if (!this.isOpen) throw new Error('supported gatt service not found')
+        if (!this.isOpen) throw new Error('Failed to connect gatt')
+        this.device.addEventListener('gattserverdisconnected', () => { void chameleon.disconnect() })
 
         // TODO: getInfoFromMini and getInfoFromTiny in BleCMDControl.java
 

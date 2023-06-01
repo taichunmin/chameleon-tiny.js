@@ -543,6 +543,7 @@ block script
                 this.showLoading(`Uploading...`, `Current: slot \#${slotIdx}, Successed: ${successed}`)
                 console.log(`slotIdx = ${slotIdx}, amiiboId = ${amiiboId}`)
                 const tag = AmiiboNtag215.fromAmiiboId(amiiboId)
+                await this.chameleon.writeEscape()
                 await this.chameleon.cmdSetSetting(`${slotIdx}`)
                 await this.chameleon.cmdExecClear()
                 await this.chameleon.cmdSetConfig('NTAG215')
